@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+rag_index.faiss
+rag_index.pkl
