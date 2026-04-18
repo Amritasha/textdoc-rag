@@ -19,11 +19,20 @@ from __future__ import annotations  # enables list[str] on Python 3.9+
 
 import os
 import sys
+import time
 import pickle
 import argparse
 import textwrap
 from pathlib import Path
 from typing import Optional
+from contextlib import contextmanager
+
+@contextmanager
+def timer(label: str):
+    t0 = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - t0
+    print(f"[time]  {label}: {elapsed * 1000:.1f} ms")
 
 import numpy as np
 import faiss
@@ -180,8 +189,9 @@ def cmd_index(files: list[str]) -> None:
 
     for path in files:
         print(f"[index] Loading  {path}")
-        text   = load_file(path)
-        chunks = chunk_text(text)
+        with timer("load + chunk"):
+            text   = load_file(path)
+            chunks = chunk_text(text)
         print(f"[index]   → {len(chunks)} chunks")
         all_chunks.extend(chunks)
 
@@ -189,14 +199,17 @@ def cmd_index(files: list[str]) -> None:
         sys.exit("[index] No chunks produced. Check your files.")
 
     print(f"[embed] Embedding {len(all_chunks)} chunks...")
-    vecs = embed(all_chunks)
+    with timer(f"embed {len(all_chunks)} chunks"):
+        vecs = embed(all_chunks)
 
-    total, _ = build_or_extend_index(all_chunks, vecs)
+    with timer("faiss add + save"):
+        total, _ = build_or_extend_index(all_chunks, vecs)
     print(f"[index] Done. Index now holds {total} vectors → saved to '{INDEX_PATH}.*'")
 
 def cmd_query(question: str) -> None:
     print(f"[query] Retrieving top-{TOP_K} chunks...")
-    hits = retrieve(question, k=TOP_K)
+    with timer("embed query + faiss search"):
+        hits = retrieve(question, k=TOP_K)
 
     if not hits:
         sys.exit("[query] No results returned from index.")
@@ -207,7 +220,8 @@ def cmd_query(question: str) -> None:
     prompt = build_prompt(question, context_chunks)
 
     print("[llm]   Generating answer...\n")
-    answer = call_llm(prompt)
+    with timer("llm generation"):
+        answer = call_llm(prompt)
 
     print("=" * 60)
     print(answer)
