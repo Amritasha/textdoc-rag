@@ -52,21 +52,81 @@ OLLAMA_MODEL = "mistral"
 
 # ─── Document Loading ─────────────────────────────────────────────────────────
 
+def _load_pdf(p: Path) -> str:
+    try:
+        import fitz
+    except ImportError:
+        sys.exit("Install pymupdf:  pip install pymupdf")
+
+    doc = fitz.open(str(p))
+    pages_text = []
+    for page in doc:
+        text = page.get_text().strip()
+        if text:
+            pages_text.append(text)
+        else:
+            # Page has no selectable text — likely scanned; fall back to OCR
+            pages_text.append(_ocr_page(page))
+    return "\n".join(pages_text)
+
+
+def _ocr_page(page) -> str:
+    """Render a pymupdf page to an image and run Tesseract OCR on it."""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+    except ImportError:
+        sys.exit(
+            "Scanned PDF detected. Install OCR deps:\n"
+            "  pip install pytesseract pillow\n"
+            "  brew install tesseract   # macOS"
+        )
+    pix = page.get_pixmap(dpi=300)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return pytesseract.image_to_string(img)
+
+
+def _load_docx(p: Path) -> str:
+    try:
+        from docx import Document
+    except ImportError:
+        sys.exit("Install python-docx:  pip install python-docx")
+    doc = Document(str(p))
+    return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+
+
+def _load_pptx(p: Path) -> str:
+    try:
+        from pptx import Presentation
+    except ImportError:
+        sys.exit("Install python-pptx:  pip install python-pptx")
+    prs = Presentation(str(p))
+    slides = []
+    for slide in prs.slides:
+        slide_text = " ".join(
+            shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()
+        )
+        if slide_text.strip():
+            slides.append(slide_text)
+    return "\n".join(slides)
+
+
 def load_file(path: str) -> str:
-    """Return plain text from a .txt or .pdf file."""
+    """Return plain text from a PDF, DOCX, PPTX, or plain-text file."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
-    if p.suffix.lower() == ".pdf":
-        try:
-            import fitz  # pymupdf
-        except ImportError:
-            sys.exit("Install pymupdf:  pip install pymupdf")
-        doc = fitz.open(str(p))
-        return "\n".join(page.get_text() for page in doc)
+    ext = p.suffix.lower()
+    if ext == ".pdf":
+        return _load_pdf(p)
+    if ext == ".docx":
+        return _load_docx(p)
+    if ext == ".pptx":
+        return _load_pptx(p)
 
-    # Fallback: plain text
+    # Fallback: plain text (.txt, .md, .csv, etc.)
     return p.read_text(encoding="utf-8", errors="replace")
 
 # ─── Chunking ────────────────────────────────────────────────────────────────
