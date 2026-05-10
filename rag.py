@@ -1,318 +1,316 @@
 """
-Minimal local RAG pipeline — no frameworks, no cloud.
+Local RAG chatbot — no frameworks, no cloud.
+
+Usage:
+    python rag.py doc1.pdf doc2.txt          # load docs and start chat
+    python rag.py                            # start chat using saved index
 
 Dependencies:
     pip install faiss-cpu sentence-transformers pymupdf requests
-
-LLM backend (pick one):
-    Ollama:  https://ollama.com  →  ollama pull mistral
-    OR set USE_OLLAMA=False and point OPENAI_BASE_URL at any OpenAI-compat server.
-
-Usage:
-    # Index documents
-    python rag.py index doc1.txt doc2.pdf
-
-    # Query
-    python rag.py query "What is the main topic?"
+    pip install python-docx python-pptx pytesseract pillow   # optional formats
+    brew install tesseract                                    # scanned PDFs only
 """
-from __future__ import annotations  # enables list[str] on Python 3.9+
+from __future__ import annotations
 
-import os
 import sys
 import time
 import pickle
-import argparse
 import textwrap
+import argparse
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
-
-@contextmanager
-def timer(label: str):
-    t0 = time.perf_counter()
-    yield
-    elapsed = time.perf_counter() - t0
-    print(f"[time]  {label}: {elapsed * 1000:.1f} ms")
+from dataclasses import dataclass, field
 
 import numpy as np
 import faiss
 import requests
 from sentence_transformers import SentenceTransformer
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Config ──────────────────────────────────────────────────────────────────
 
-INDEX_PATH   = "rag_index"        # base name; saves .faiss + .pkl
-EMBED_MODEL  = "all-MiniLM-L6-v2" # ~80 MB, CPU-friendly, dim=384
-CHUNK_SIZE   = 400                 # words per chunk
-CHUNK_OVERLAP = 50                 # word overlap between consecutive chunks
-TOP_K        = 5                   # retrieved chunks per query
+INDEX_PATH      = "rag_index"
+EMBED_MODEL     = "all-MiniLM-L6-v2"
+CHUNK_SIZE      = 400
+CHUNK_OVERLAP   = 50
+TOP_K           = 5
+HISTORY_TURNS   = 4       # past Q&A pairs included in each prompt
+SCORE_THRESHOLD = 0.25    # min cosine similarity to accept a retrieval result
 
 OLLAMA_URL   = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "mistral"
 
-# ─── Document Loading ─────────────────────────────────────────────────────────
+# ─── Timing ──────────────────────────────────────────────────────────────────
+
+@contextmanager
+def timer(label: str):
+    t0 = time.perf_counter()
+    yield
+    print(f"  [{(time.perf_counter() - t0) * 1000:.0f} ms] {label}")
+
+# ─── Document Loaders ────────────────────────────────────────────────────────
 
 def _load_pdf(p: Path) -> str:
     try:
         import fitz
     except ImportError:
-        sys.exit("Install pymupdf:  pip install pymupdf")
-
+        sys.exit("pip install pymupdf")
     doc = fitz.open(str(p))
-    pages_text = []
+    pages = []
     for page in doc:
         text = page.get_text().strip()
-        if text:
-            pages_text.append(text)
-        else:
-            # Page has no selectable text — likely scanned; fall back to OCR
-            pages_text.append(_ocr_page(page))
-    return "\n".join(pages_text)
-
+        pages.append(text if text else _ocr_page(page))
+    return "\n".join(pages)
 
 def _ocr_page(page) -> str:
-    """Render a pymupdf page to an image and run Tesseract OCR on it."""
     try:
         import pytesseract
         from PIL import Image
         import io
     except ImportError:
-        sys.exit(
-            "Scanned PDF detected. Install OCR deps:\n"
-            "  pip install pytesseract pillow\n"
-            "  brew install tesseract   # macOS"
-        )
+        sys.exit("Scanned PDF needs: pip install pytesseract pillow && brew install tesseract")
     pix = page.get_pixmap(dpi=300)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return pytesseract.image_to_string(img)
-
+    return pytesseract.image_to_string(Image.open(io.BytesIO(pix.tobytes("png"))))
 
 def _load_docx(p: Path) -> str:
     try:
         from docx import Document
     except ImportError:
-        sys.exit("Install python-docx:  pip install python-docx")
-    doc = Document(str(p))
-    return "\n".join(para.text for para in doc.paragraphs if para.text.strip())
-
+        sys.exit("pip install python-docx")
+    return "\n".join(para.text for para in Document(str(p)).paragraphs if para.text.strip())
 
 def _load_pptx(p: Path) -> str:
     try:
         from pptx import Presentation
     except ImportError:
-        sys.exit("Install python-pptx:  pip install python-pptx")
-    prs = Presentation(str(p))
+        sys.exit("pip install python-pptx")
     slides = []
-    for slide in prs.slides:
-        slide_text = " ".join(
-            shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text.strip()
-        )
-        if slide_text.strip():
-            slides.append(slide_text)
+    for slide in Presentation(str(p)).slides:
+        text = " ".join(s.text for s in slide.shapes if hasattr(s, "text") and s.text.strip())
+        if text.strip():
+            slides.append(text)
     return "\n".join(slides)
 
-
 def load_file(path: str) -> str:
-    """Return plain text from a PDF, DOCX, PPTX, or plain-text file."""
     p = Path(path)
     if not p.exists():
-        raise FileNotFoundError(f"File not found: {path}")
-
+        raise FileNotFoundError(path)
     ext = p.suffix.lower()
-    if ext == ".pdf":
-        return _load_pdf(p)
-    if ext == ".docx":
-        return _load_docx(p)
-    if ext == ".pptx":
-        return _load_pptx(p)
-
-    # Fallback: plain text (.txt, .md, .csv, etc.)
+    if ext == ".pdf":  return _load_pdf(p)
+    if ext == ".docx": return _load_docx(p)
+    if ext == ".pptx": return _load_pptx(p)
     return p.read_text(encoding="utf-8", errors="replace")
 
 # ─── Chunking ────────────────────────────────────────────────────────────────
 
 def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
-    """
-    Split text into overlapping word-count chunks.
-    Overlap avoids cutting a sentence's context in half at boundaries.
-    """
     words = text.split()
-    chunks: list[str] = []
-    step = max(1, size - overlap)
-    for start in range(0, len(words), step):
-        chunk = " ".join(words[start : start + size])
-        if chunk.strip():
-            chunks.append(chunk)
-    return chunks
+    step  = max(1, size - overlap)
+    return [
+        " ".join(words[i : i + size])
+        for i in range(0, len(words), step)
+        if words[i : i + size]
+    ]
 
-# ─── Embedding ───────────────────────────────────────────────────────────────
+# ─── Embedder (singleton) ────────────────────────────────────────────────────
 
 _embedder: Optional[SentenceTransformer] = None
 
 def get_embedder() -> SentenceTransformer:
     global _embedder
     if _embedder is None:
-        print(f"[embed] Loading model '{EMBED_MODEL}' (first run downloads ~80 MB)...")
+        print(f"Loading embedding model '{EMBED_MODEL}'...")
         _embedder = SentenceTransformer(EMBED_MODEL)
     return _embedder
 
 def embed(texts: list[str]) -> np.ndarray:
-    """Return L2-normalised float32 embeddings (n × dim)."""
     vecs = get_embedder().encode(texts, normalize_embeddings=True, show_progress_bar=False)
     return np.array(vecs, dtype="float32")
 
-# ─── FAISS Index ─────────────────────────────────────────────────────────────
+# ─── In-memory Index ─────────────────────────────────────────────────────────
 
-def _dim() -> int:
-    return get_embedder().get_sentence_embedding_dimension()
+@dataclass
+class Index:
+    faiss_index: faiss.Index
+    chunks: list[str]
 
-def load_index() -> tuple[faiss.Index, list[str]]:
-    """Load a previously saved index. Exits cleanly if not found."""
-    faiss_file = f"{INDEX_PATH}.faiss"
-    meta_file  = f"{INDEX_PATH}.pkl"
-    if not Path(faiss_file).exists():
-        sys.exit(f"No index found at '{faiss_file}'. Run:  python rag.py index <files>")
-    index  = faiss.read_index(faiss_file)
-    chunks = pickle.loads(Path(meta_file).read_bytes())
-    return index, chunks
+    @classmethod
+    def build(cls, chunks: list[str], vecs: np.ndarray) -> Index:
+        idx = faiss.IndexFlatIP(vecs.shape[1])
+        idx.add(vecs)
+        return cls(idx, chunks)
 
-def save_index(index: faiss.Index, chunks: list[str]) -> None:
-    faiss.write_index(index, f"{INDEX_PATH}.faiss")
-    Path(f"{INDEX_PATH}.pkl").write_bytes(pickle.dumps(chunks))
+    @classmethod
+    def load_from_disk(cls) -> Index:
+        fp = f"{INDEX_PATH}.faiss"
+        if not Path(fp).exists():
+            sys.exit(f"No saved index at '{fp}'. Pass document files to load them.")
+        idx    = faiss.read_index(fp)
+        chunks = pickle.loads(Path(f"{INDEX_PATH}.pkl").read_bytes())
+        return cls(idx, chunks)
 
-def build_or_extend_index(new_chunks: list[str], new_vecs: np.ndarray) -> None:
-    """Add vectors to an existing index, or create a new one."""
-    faiss_file = f"{INDEX_PATH}.faiss"
-    if Path(faiss_file).exists():
-        index, existing_chunks = load_index()
-        existing_chunks.extend(new_chunks)
-    else:
-        # IndexFlatIP = exact cosine similarity (on unit vectors)
-        index = faiss.IndexFlatIP(_dim())
-        existing_chunks = new_chunks[:]
+    def save(self) -> None:
+        faiss.write_index(self.faiss_index, f"{INDEX_PATH}.faiss")
+        Path(f"{INDEX_PATH}.pkl").write_bytes(pickle.dumps(self.chunks))
 
-    index.add(new_vecs)
-    save_index(index, existing_chunks)
-    return index.ntotal, existing_chunks
+    def search(self, query: str, k: int = TOP_K) -> list[tuple[float, str]]:
+        q_vec = embed([query])
+        scores, indices = self.faiss_index.search(q_vec, k)
+        return [
+            (float(s), self.chunks[i])
+            for s, i in zip(scores[0], indices[0])
+            if i != -1
+        ]
 
-# ─── Retrieval ────────────────────────────────────────────────────────────────
-
-def retrieve(query: str, k: int = TOP_K) -> list[tuple[float, str]]:
-    """Return (score, chunk) pairs, best match first."""
-    index, chunks = load_index()
-    q_vec = embed([query])
-    scores, indices = index.search(q_vec, k)
-    results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx != -1:
-            results.append((float(score), chunks[idx]))
-    return results
-
-# ─── LLM Call (Ollama) ───────────────────────────────────────────────────────
+# ─── LLM ─────────────────────────────────────────────────────────────────────
 
 def call_llm(prompt: str) -> str:
-    """Send prompt to a locally running Ollama instance and return the response."""
     try:
         resp = requests.post(
             OLLAMA_URL,
             json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            timeout=120,
+            timeout=180,
         )
         resp.raise_for_status()
         return resp.json().get("response", "").strip()
     except requests.exceptions.ConnectionError:
-        sys.exit(
-            f"\n[error] Cannot reach Ollama at {OLLAMA_URL}.\n"
-            "  Start it with:  ollama serve\n"
-            f"  Then pull a model:  ollama pull {OLLAMA_MODEL}\n"
-        )
+        sys.exit(f"\nCannot reach Ollama at {OLLAMA_URL}.\nRun: ollama serve && ollama pull {OLLAMA_MODEL}\n")
 
-def build_prompt(query: str, context_chunks: list[str]) -> str:
+# ─── Prompt ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class Turn:
+    question: str
+    answer: str
+
+def build_prompt(question: str, context_chunks: list[str], history: list[Turn]) -> str:
     context = "\n\n---\n\n".join(context_chunks)
+
+    history_block = ""
+    if history:
+        lines = []
+        for t in history[-HISTORY_TURNS:]:
+            lines.append(f"User: {t.question}")
+            lines.append(f"Assistant: {t.answer}")
+        history_block = "\nCONVERSATION HISTORY:\n" + "\n".join(lines) + "\n"
+
     return textwrap.dedent(f"""\
-        You are a helpful assistant. Use only the context below to answer the question.
+        You are a helpful assistant. Answer using only the context provided.
         If the answer is not in the context, say "I don't know based on the provided documents."
+        Use the conversation history to resolve follow-up questions and references to prior answers.
 
         CONTEXT:
         {context}
-
-        QUESTION:
-        {query}
+        {history_block}
+        CURRENT QUESTION:
+        {question}
 
         ANSWER:
     """)
 
-# ─── CLI Commands ─────────────────────────────────────────────────────────────
+# ─── Chat Loop ───────────────────────────────────────────────────────────────
 
-def cmd_index(files: list[str]) -> None:
-    all_chunks: list[str] = []
+HELP = """
+  Commands:
+    history   — show all Q&A from this session
+    clear     — clear conversation history
+    quit      — exit
+"""
 
-    for path in files:
-        print(f"[index] Loading  {path}")
-        with timer("load + chunk"):
-            text   = load_file(path)
-            chunks = chunk_text(text)
-        print(f"[index]   → {len(chunks)} chunks")
-        all_chunks.extend(chunks)
+def chat(index: Index) -> None:
+    history: list[Turn] = []
+    print("\nReady. Ask a question about your documents.")
+    print(HELP)
 
-    if not all_chunks:
-        sys.exit("[index] No chunks produced. Check your files.")
+    while True:
+        try:
+            question = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            break
 
-    print(f"[embed] Embedding {len(all_chunks)} chunks...")
-    with timer(f"embed {len(all_chunks)} chunks"):
-        vecs = embed(all_chunks)
+        if not question:
+            continue
 
-    with timer("faiss add + save"):
-        total, _ = build_or_extend_index(all_chunks, vecs)
-    print(f"[index] Done. Index now holds {total} vectors → saved to '{INDEX_PATH}.*'")
+        if question.lower() in {"quit", "exit", "q"}:
+            print("Bye.")
+            break
 
-def cmd_query(question: str) -> None:
-    print(f"[query] Retrieving top-{TOP_K} chunks...")
-    with timer("embed query + faiss search"):
-        hits = retrieve(question, k=TOP_K)
+        if question.lower() == "history":
+            if not history:
+                print("  No questions asked yet.\n")
+            else:
+                for i, t in enumerate(history, 1):
+                    print(f"  Q{i}: {t.question}")
+                    preview = t.answer[:160] + ("..." if len(t.answer) > 160 else "")
+                    print(f"  A{i}: {preview}\n")
+            continue
 
-    if not hits:
-        sys.exit("[query] No results returned from index.")
+        if question.lower() == "clear":
+            history.clear()
+            print("  Conversation history cleared.\n")
+            continue
 
-    print(f"[query] Top match score: {hits[0][0]:.4f}\n")
+        with timer("retrieve"):
+            hits = index.search(question, k=TOP_K)
 
-    context_chunks = [chunk for _, chunk in hits]
-    prompt = build_prompt(question, context_chunks)
+        if not hits or hits[0][0] < SCORE_THRESHOLD:
+            print("  Bot: I couldn't find relevant information in the documents for that question.\n")
+            continue
 
-    print("[llm]   Generating answer...\n")
-    with timer("llm generation"):
-        answer = call_llm(prompt)
+        context_chunks = [chunk for _, chunk in hits]
+        prompt = build_prompt(question, context_chunks, history)
 
-    print("=" * 60)
-    print(answer)
-    print("=" * 60)
+        with timer("llm"):
+            answer = call_llm(prompt)
+
+        print(f"\n  Bot: {answer}\n")
+        history.append(Turn(question=question, answer=answer))
 
 # ─── Entry Point ─────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Minimal local RAG — FAISS + SentenceTransformers + Ollama",
+        description="Local RAG chatbot — ask questions about your documents",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
-              python rag.py index report.pdf notes.txt
-              python rag.py query "What are the key findings?"
+              python rag.py report.pdf notes.txt    # load docs and chat
+              python rag.py                         # chat using saved index
         """),
     )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    p_index = sub.add_parser("index", help="Embed and index documents")
-    p_index.add_argument("files", nargs="+", help="PDF or TXT files to index")
-
-    p_query = sub.add_parser("query", help="Ask a question against indexed docs")
-    p_query.add_argument("question", help="Natural language question")
-
+    parser.add_argument("files", nargs="*", help="PDF, DOCX, PPTX, or TXT files to load")
     args = parser.parse_args()
 
-    if args.command == "index":
-        cmd_index(args.files)
-    elif args.command == "query":
-        cmd_query(args.question)
+    if args.files:
+        all_chunks: list[str] = []
+        for path in args.files:
+            print(f"Loading  {path}")
+            with timer("load + chunk"):
+                text   = load_file(path)
+                chunks = chunk_text(text)
+            print(f"  → {len(chunks)} chunks")
+            all_chunks.extend(chunks)
+
+        if not all_chunks:
+            sys.exit("No content extracted. Check your files.")
+
+        print(f"\nEmbedding {len(all_chunks)} chunks...")
+        with timer("embed"):
+            vecs = embed(all_chunks)
+
+        with timer("build index"):
+            index = Index.build(all_chunks, vecs)
+
+        index.save()
+        print(f"Index ready — {index.faiss_index.ntotal} vectors.\n")
+    else:
+        print("No files given — loading saved index from disk...")
+        with timer("load index"):
+            index = Index.load_from_disk()
+        print(f"Loaded {index.faiss_index.ntotal} vectors.\n")
+
+    chat(index)
 
 if __name__ == "__main__":
     main()
